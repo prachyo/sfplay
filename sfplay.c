@@ -62,6 +62,9 @@ typedef struct VideoState {
   int             av_sync_type;
   double          external_clock; /* external clock base */
   int64_t         external_clock_time;
+  int             seek_req;
+  int             seek_flags;
+  int64_t         seek_pos;
 
   double          audio_clock;
   AVStream        *audio_st;
@@ -114,16 +117,18 @@ SDL_mutex       *screen_mutex;
 /* Since we only have one decoding thread, the Big Struct
    can be global in case we need it. */
 VideoState *global_video_state;
+AVPacket flush_pkt;
 
 void packet_queue_init(PacketQueue *q) {
   memset(q, 0, sizeof(PacketQueue));
   q->mutex = SDL_CreateMutex();
   q->cond = SDL_CreateCond();
 }
+
 int packet_queue_put(PacketQueue *q, AVPacket *pkt) {
 
   AVPacketList *pkt1;
-  if(av_dup_packet(pkt) < 0) {
+  if(pkt != &flush_pkt && av_dup_packet(pkt) < 0) {
     return -1;
   }
   pkt1 = av_malloc(sizeof(AVPacketList));
@@ -180,6 +185,22 @@ static int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block)
   }
   SDL_UnlockMutex(q->mutex);
   return ret;
+}
+
+static void packet_queue_flush(PacketQueue *q) {
+  AVPacketList *pkt, *pkt1;
+
+  SDL_LockMutex(q->mutex);
+  for(pkt = q->first_pkt; pkt != NULL; pkt = pkt1) {
+    pkt1 = pkt->next;
+    av_free_packet(&pkt->pkt);
+    av_freep(&pkt);
+  }
+  q->last_pkt = NULL;
+  q->first_pkt = NULL;
+  q->nb_packets = 0;
+  q->size = 0;
+  SDL_UnlockMutex(q->mutex);
 }
 
 double get_audio_clock(VideoState *is) {
@@ -330,6 +351,10 @@ int audio_decode_frame(VideoState *is, uint8_t *audio_buf, int buf_size, double 
     /* next packet */
     if(packet_queue_get(&is->audioq, pkt, 1) < 0) {
       return -1;
+    }
+    if(pkt->data == flush_pkt.data) {
+      avcodec_flush_buffers(is->audio_ctx);
+      continue;
     }
     is->audio_pkt_data = pkt->data;
     is->audio_pkt_size = pkt->size;
@@ -546,7 +571,6 @@ int queue_picture(VideoState *is, AVFrame *pFrame, double pts) {
       return -1;
     }
   }
-
   /* We have a place to put our picture on the queue */
 
   if(vp->bmp) {
@@ -625,6 +649,7 @@ int video_thread(void *arg) {
     avcodec_decode_video2(is->video_ctx, pFrame, &frameFinished, packet);
 
     if((pts = av_frame_get_best_effort_timestamp(pFrame)) == AV_NOPTS_VALUE) {
+      pts = av_frame_get_best_effort_timestamp(pFrame);
     } else {
       pts = 0;
     }
@@ -780,6 +805,35 @@ int decode_thread(void *arg) {
       break;
     }
     // seek stuff goes here
+    if(is->seek_req) {
+      int stream_index= -1;
+      int64_t seek_target = is->seek_pos;
+
+      if     (is->videoStream >= 0) stream_index = is->videoStream;
+      else if(is->audioStream >= 0) stream_index = is->audioStream;
+
+      if(stream_index>=0){
+	seek_target= av_rescale_q(seek_target, AV_TIME_BASE_Q,
+				  pFormatCtx->streams[stream_index]->time_base);
+      }
+      if(av_seek_frame(is->pFormatCtx, stream_index, 
+		       seek_target, is->seek_flags) < 0) {
+	fprintf(stderr, "%s: error while seeking\n",
+		is->pFormatCtx->filename);
+      } else {
+
+	if(is->audioStream >= 0) {
+	  packet_queue_flush(&is->audioq);
+	  packet_queue_put(&is->audioq, &flush_pkt);
+	}
+	if(is->videoStream >= 0) {
+	  packet_queue_flush(&is->videoq);
+	  packet_queue_put(&is->videoq, &flush_pkt);
+	}
+      }
+      is->seek_req = 0;
+    }
+
     if(is->audioq.size > MAX_AUDIOQ_SIZE ||
        is->videoq.size > MAX_VIDEOQ_SIZE) {
       SDL_Delay(10);
@@ -815,6 +869,15 @@ int decode_thread(void *arg) {
     SDL_PushEvent(&event);
   }
   return 0;
+}
+
+void stream_seek(VideoState *is, int64_t pos, int rel) {
+
+  if(!is->seek_req) {
+    is->seek_pos = pos;
+    is->seek_flags = rel < 0 ? AVSEEK_FLAG_BACKWARD : 0;
+    is->seek_req = 1;
+  }
 }
 
 int main(int argc, char *argv[]) {
@@ -863,13 +926,49 @@ int main(int argc, char *argv[]) {
     av_free(is);
     return -1;
   }
-  for(;;) {
 
+  av_init_packet(&flush_pkt);
+  flush_pkt.data = "FLUSH";
+
+  for(;;) {
+    double incr, pos;
     SDL_WaitEvent(&event);
     switch(event.type) {
+    case SDL_KEYDOWN:
+      switch(event.key.keysym.sym) {
+      case SDLK_LEFT:
+	incr = -10.0;
+	goto do_seek;
+      case SDLK_RIGHT:
+	incr = 10.0;
+	goto do_seek;
+      case SDLK_UP:
+	incr = 60.0;
+	goto do_seek;
+      case SDLK_DOWN:
+	incr = -60.0;
+	goto do_seek;
+      do_seek:
+	if(global_video_state) {
+	  pos = get_master_clock(global_video_state);
+	  pos += incr;
+	  stream_seek(global_video_state, (int64_t)(pos * AV_TIME_BASE), incr);
+	}
+	break;
+      default:
+	break;
+      }
+      break;
     case FF_QUIT_EVENT:
     case SDL_QUIT:
       is->quit = 1;
+      /*
+       * If the video has finished playing, then both the picture and
+       * audio queues are waiting for more data.  Make them stop
+       * waiting and terminate normally.
+       */
+      SDL_CondSignal(is->audioq.cond);
+      SDL_CondSignal(is->videoq.cond);
       SDL_Quit();
       return 0;
       break;
