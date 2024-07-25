@@ -28,10 +28,15 @@
 #define AV_SYNC_THRESHOLD 0.01
 #define AV_NOSYNC_THRESHOLD 10.0
 
+#define SAMPLE_CORRECTION_PERCENT_MAX 10
+#define AUDIO_DIFF_AVG_NB 20
+
 #define FF_REFRESH_EVENT (SDL_USEREVENT)
 #define FF_QUIT_EVENT (SDL_USEREVENT + 1)
 
 #define VIDEO_PICTURE_QUEUE_SIZE 1
+
+#define DEFAULT_AV_SYNC_TYPE AV_SYNC_VIDEO_MASTER
 
 typedef struct PacketQueue {
   AVPacketList *first_pkt, *last_pkt;
@@ -54,6 +59,10 @@ typedef struct VideoState {
   AVFormatContext *pFormatCtx;
   int             videoStream, audioStream;
 
+  int             av_sync_type;
+  double          external_clock; /* external clock base */
+  int64_t         external_clock_time;
+
   double          audio_clock;
   AVStream        *audio_st;
   AVCodecContext  *audio_ctx;
@@ -65,11 +74,17 @@ typedef struct VideoState {
   AVPacket        audio_pkt;
   uint8_t         *audio_pkt_data;
   int             audio_pkt_size;
-  int             audio_hw_buf_size;  
+  int             audio_hw_buf_size;
+  double          audio_diff_cum; /* used for AV difference average computation */
+  double          audio_diff_avg_coef;
+  double          audio_diff_threshold;
+  int             audio_diff_avg_count;
   double          frame_timer;
   double          frame_last_pts;
   double          frame_last_delay;
   double          video_clock; ///<pts of last decoded frame / predicted pts of next decoded frame
+  double          video_current_pts; ///<current displayed pts (different from video_clock if frame fifos are used)
+  int64_t         video_current_pts_time;  ///<time (av_gettime) at which we updated video_current_pts - used to have running video pts
   AVStream        *video_st;
   AVCodecContext  *video_ctx;
   PacketQueue     videoq;
@@ -86,6 +101,12 @@ typedef struct VideoState {
   char            filename[1024];
   int             quit;
 } VideoState;
+
+enum {
+  AV_SYNC_AUDIO_MASTER,
+  AV_SYNC_VIDEO_MASTER,
+  AV_SYNC_EXTERNAL_MASTER,
+};
 
 SDL_Surface     *screen;
 SDL_mutex       *screen_mutex;
@@ -177,6 +198,88 @@ double get_audio_clock(VideoState *is) {
   }
   return pts;
 }
+double get_video_clock(VideoState *is) {
+  double delta;
+
+  delta = (av_gettime() - is->video_current_pts_time) / 1000000.0;
+  return is->video_current_pts + delta;
+}
+double get_external_clock(VideoState *is) {
+  return av_gettime() / 1000000.0;
+}
+
+double get_master_clock(VideoState *is) {
+  if(is->av_sync_type == AV_SYNC_VIDEO_MASTER) {
+    return get_video_clock(is);
+  } else if(is->av_sync_type == AV_SYNC_AUDIO_MASTER) {
+    return get_audio_clock(is);
+  } else {
+    return get_external_clock(is);
+  }
+}
+
+
+/* Add or subtract samples to get a better sync, return new
+   audio buffer size */
+int synchronize_audio(VideoState *is, short *samples,
+		      int samples_size, double pts) {
+  int n;
+  double ref_clock;
+
+  n = 2 * is->audio_ctx->channels;
+  
+  if(is->av_sync_type != AV_SYNC_AUDIO_MASTER) {
+    double diff, avg_diff;
+    int wanted_size, min_size, max_size /*, nb_samples */;
+    
+    ref_clock = get_master_clock(is);
+    diff = get_audio_clock(is) - ref_clock;
+
+    if(diff < AV_NOSYNC_THRESHOLD) {
+      // accumulate the diffs
+      is->audio_diff_cum = diff + is->audio_diff_avg_coef
+	* is->audio_diff_cum;
+      if(is->audio_diff_avg_count < AUDIO_DIFF_AVG_NB) {
+	is->audio_diff_avg_count++;
+      } else {
+	avg_diff = is->audio_diff_cum * (1.0 - is->audio_diff_avg_coef);
+	if(fabs(avg_diff) >= is->audio_diff_threshold) {
+	  wanted_size = samples_size + ((int)(diff * is->audio_ctx->sample_rate) * n);
+	  min_size = samples_size * ((100 - SAMPLE_CORRECTION_PERCENT_MAX) / 100);
+	  max_size = samples_size * ((100 + SAMPLE_CORRECTION_PERCENT_MAX) / 100);
+	  if(wanted_size < min_size) {
+	    wanted_size = min_size;
+	  } else if (wanted_size > max_size) {
+	    wanted_size = max_size;
+	  }
+	  if(wanted_size < samples_size) {
+	    /* remove samples */
+	    samples_size = wanted_size;
+	  } else if(wanted_size > samples_size) {
+	    uint8_t *samples_end, *q;
+	    int nb;
+
+	    /* add samples by copying final sample*/
+	    nb = (samples_size - wanted_size);
+	    samples_end = (uint8_t *)samples + samples_size - n;
+	    q = samples_end + n;
+	    while(nb > 0) {
+	      memcpy(q, samples_end, n);
+	      q += n;
+	      nb -= n;
+	    }
+	    samples_size = wanted_size;
+	  }
+	}
+      }
+    } else {
+      /* difference is TOO big; reset diff stuff */
+      is->audio_diff_avg_count = 0;
+      is->audio_diff_cum = 0;
+    }
+  }
+  return samples_size;
+}
 
 int audio_decode_frame(VideoState *is, uint8_t *audio_buf, int buf_size, double *pts_ptr) {
 
@@ -252,6 +355,8 @@ void audio_callback(void *userdata, Uint8 *stream, int len) {
 	is->audio_buf_size = 1024;
 	memset(is->audio_buf, 0, is->audio_buf_size);
       } else {
+	audio_size = synchronize_audio(is, (int16_t *)is->audio_buf,
+				       audio_size, pts);
 	is->audio_buf_size = audio_size;
       }
       is->audio_buf_index = 0;
@@ -315,7 +420,6 @@ void video_display(VideoState *is) {
     SDL_LockMutex(screen_mutex);
     SDL_DisplayYUVOverlay(vp->bmp, &rect);
     SDL_UnlockMutex(screen_mutex);
-
   }
 }
 
@@ -330,7 +434,9 @@ void video_refresh_timer(void *userdata) {
       schedule_refresh(is, 1);
     } else {
       vp = &is->pictq[is->pictq_rindex];
-
+      
+      is->video_current_pts = vp->pts;
+      is->video_current_pts_time = av_gettime();
       delay = vp->pts - is->frame_last_pts; /* the pts from last time */
       if(delay <= 0 || delay >= 1.0) {
 	/* if incorrect delay, use previous one */
@@ -340,18 +446,22 @@ void video_refresh_timer(void *userdata) {
       is->frame_last_delay = delay;
       is->frame_last_pts = vp->pts;
 
-      /* update delay to sync to audio */
-      ref_clock = get_audio_clock(is);
-      diff = vp->pts - ref_clock;
 
-      /* Skip or repeat the frame. Take delay into account
-	 FFPlay still doesn't "know if this is the best guess." */
-      sync_threshold = (delay > AV_SYNC_THRESHOLD) ? delay : AV_SYNC_THRESHOLD;
-      if(fabs(diff) < AV_NOSYNC_THRESHOLD) {
-	if(diff <= -sync_threshold) {
-	  delay = 0;
-	} else if(diff >= sync_threshold) {
-	  delay = 2 * delay;
+
+      /* update delay to sync to audio if not master source */
+      if(is->av_sync_type != AV_SYNC_VIDEO_MASTER) {
+	ref_clock = get_master_clock(is);
+	diff = vp->pts - ref_clock;
+	
+	/* Skip or repeat the frame. Take delay into account
+	   FFPlay still doesn't "know if this is the best guess." */
+	sync_threshold = (delay > AV_SYNC_THRESHOLD) ? delay : AV_SYNC_THRESHOLD;
+	if(fabs(diff) < AV_NOSYNC_THRESHOLD) {
+	  if(diff <= -sync_threshold) {
+	    delay = 0;
+	  } else if(diff >= sync_threshold) {
+	    delay = 2 * delay;
+	  }
 	}
       }
       is->frame_timer += delay;
@@ -515,6 +625,7 @@ int video_thread(void *arg) {
     avcodec_decode_video2(is->video_ctx, pFrame, &frameFinished, packet);
 
     if((pts = av_frame_get_best_effort_timestamp(pFrame)) == AV_NOPTS_VALUE) {
+    } else {
       pts = 0;
     }
     pts *= av_q2d(is->video_st->time_base);
@@ -595,7 +706,8 @@ int stream_component_open(VideoState *is, int stream_index) {
 
     is->frame_timer = (double)av_gettime() / 1000000.0;
     is->frame_last_delay = 40e-3;
-    
+    is->video_current_pts_time = av_gettime();
+
     packet_queue_init(&is->videoq);
     is->video_tid = SDL_CreateThread(video_thread, is);
     is->sws_ctx = sws_getContext(is->video_ctx->width, is->video_ctx->height,
@@ -745,6 +857,7 @@ int main(int argc, char *argv[]) {
 
   schedule_refresh(is, 40);
 
+  is->av_sync_type = DEFAULT_AV_SYNC_TYPE;
   is->parse_tid = SDL_CreateThread(decode_thread, is);
   if(!is->parse_tid) {
     av_free(is);
