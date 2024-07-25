@@ -1,5 +1,4 @@
 # sfplay
-===
 
 A very basic video player that is mostly just a testing ground for the ffmpeg API.
 
@@ -11,9 +10,9 @@ Some features include:
 * Rudimentary seeking
 
 ### Dependencies
-
-This project requires that you have libavformat, libavcodec and sdl-config installed
 -------
+This project requires that you have libavformat, libavcodec and sdl-config installed
+
 ```
 gcc -o sfplay sfplay.c -lavformat -lavcodec -lswscale -lz -lm `sdl-config --cflags --libs`
 ```
