@@ -38,6 +38,8 @@
 
 #define DEFAULT_AV_SYNC_TYPE AV_SYNC_VIDEO_MASTER
 
+const char program_name[] = "sfplay";
+
 typedef struct PacketQueue {
   AVPacketList *first_pkt, *last_pkt;
   int nb_packets;
